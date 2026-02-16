@@ -1,1 +1,833 @@
-import illustris_python as il# otras cosas utiles que hay que conviene cargar#import ytimport pandas as pdimport numpy as npfrom astropy.cosmology import z_at_valueimport astropy.units as ufrom astropy.cosmology import Planck15 as cosmoimport globimport picklefrom collections import defaultdictfrom collections import Counter#from natsort import natsortedimport sysimport globimport copyimport timeimport osimport fnmatchfrom scipy.spatial.kdtree import cKDTreeimport gcimport randomimport h5pyimport argparserandom.seed(100)#%%parser = argparse.ArgumentParser(    description="Local Volume particle selection for a given halo")# --- Required arguments ---parser.add_argument(    "--basePath",    type=str,    required=True,    help="Path to simulation snapshot directory")parser.add_argument(    "--savePath",    type=str,    required=True,    help="Path where output files will be saved")parser.add_argument(    "--halo_id",    type=int,    required=True,    help="Halo ID to analyse")args = parser.parse_args()basePath = args.basePathsavePath = args.savePathcentral = args.halo_idos.makedirs(savePath, exist_ok=True)Header = il.groupcat.loadHeader(basePath,99)h = float(Header['HubbleParam'])unitsconv = 1/(1+float(Header['Redshift']))/hunitsmassconv = 1e10/hmass_dm = 3.1*10**5/h# We need the virial radius and other parameters of our central galaxiesGroupsData = il.groupcat.loadHalos(basePath,99,['GroupFirstSub','GroupNsubs','Group_R_Crit200','Group_M_Crit200'])#%%def read_snapshot(directory,snap):    ID = 'dm'    try:        MainPath = directory+'/snapdir_'+str(snap).zfill(3)+'/snap_'+str(snap).zfill(3)+'_all.hdf5'        datos = pd.read_hdf(MainPath)    except FileNotFoundError:        data_snap = il.snapshot.loadSubset(directory,snap,'dm',['ParticleIDs','Coordinates'])        datos = {'ParticleIDs' : data_snap['ParticleIDs'],                 'x' : data_snap['Coordinates'][:,0],                 'y' : data_snap['Coordinates'][:,1],                 'z' : data_snap['Coordinates'][:,2]}        datos = pd.DataFrame(data = datos)        del data_snap        gc.collect()                datos.to_hdf(directory+'/snapdir_'+str(snap).zfill(3)+'/snap_'+str(snap).zfill(3)+'_all.hdf5',ID,mode = 'w',format = 'fixed')    return datosdef select_ids_in_radius(pos, center, radius):    ids = np.array([])    for p in pos:        tree = cKDTree(p.values, 35000)        ind = tree.query_ball_point(center, radius, n_jobs=-1)        ids = np.concatenate([ids, p.index[ind]])        del(tree)    return ids    def save_in_hdf5(snapshot,boxes,b,dataset):#    print('Subbox #',b)    parts = np.where(boxes == b)[0]    hf = h5py.File(basePath+'/snapdir_'+str(snapshot).zfill(3)+'_ordered/snap_'+str(snapshot).zfill(3)+'.'+str(b).zfill(3)+'_ordered.hdf5','a')        ##    hf['ParticleIDs'].resize(hf['ParticleIDs'].shape[0] + parts.shape[0],axis = 0)    hf["ParticleIDs"][-parts.shape[0]:] = list(dataset['ParticleIDs'][parts])    ##    hf['x'].resize(hf['x'].shape[0] + parts.shape[0],axis = 0)    hf["x"][-parts.shape[0]:] = list(dataset['Coordinates'][parts,0])    ##    hf['y'].resize(hf['y'].shape[0] + parts.shape[0],axis = 0)    hf["y"][-parts.shape[0]:] = list(dataset['Coordinates'][parts,1])    ##    hf['z'].resize(hf['z'].shape[0] + parts.shape[0],axis = 0)    hf["z"][-parts.shape[0]:] = list(dataset['Coordinates'][parts,2])    hf.close()        return print('Box',b,'Done!')    def pSplitRange(indrange, numProcs, curProc, inclusive=False):    """ Divide work for embarassingly parallel problems.     Accept a 2-tuple of [start,end] indices and return a new range subset.    If inclusive==True, then assume the range subset will be used e.g. as input to snapshotSubseet(),    which unlike numpy convention is inclusive in the indices."""    assert len(indrange) == 2 and indrange[1] > indrange[0]    if numProcs == 1:        if curProc != 0:            raise Exception("Only a single processor but requested curProc>0.")        return indrange    # split array into numProcs segments, and return the curProc'th segment    splitSize = int(np.floor( (indrange[1]-indrange[0]) / numProcs ))    start = indrange[0] + curProc*splitSize    end   = indrange[0] + (curProc+1)*splitSize    # for last split, make sure it takes any leftovers    if curProc == numProcs-1:        end = indrange[1]    if inclusive and curProc < numProcs-1:        # not for last split/final index, because this should be e.g. NumPart[0]-1 already        end -= 1    return [start,end]def loadSubset(simPath, snap, partType, fields, chunkNum=0, totNumChunks=1):    """ Load part of a snapshot. """    nTypes = 6    ptNum = il.util.partTypeNum(partType)    with h5py.File(il.snapshot.snapPath(simPath,snap),'r') as f:        numPartTot = il.snapshot.getNumPart( dict(f['Header'].attrs.items()) )[ptNum]    # define index range    indRange_fullSnap = [0,numPartTot-1]    indRange = pSplitRange(indRange_fullSnap, totNumChunks, chunkNum, inclusive=True)    # load a contiguous chunk by making a subset specification in analogy to the group ordered loads    subset = { 'offsetType'  : np.zeros(nTypes, dtype='int64'),               'lenType'     : np.zeros(nTypes, dtype='int64') }    subset['offsetType'][ptNum] = indRange[0]    subset['lenType'][ptNum]    = indRange[1]-indRange[0]+1    # add snap offsets (as required)    with h5py.File(il.snapshot.offsetPath(simPath,snap),'r') as f:        subset['snapOffsets'] = np.transpose(f['FileOffsets/SnapByType'][()])    # load from disk    r = il.snapshot.loadSubset(simPath, snap, partType, fields, subset=subset)    return rdef select_particles_in_region(path,snapNum,partType,central_pos,radius,fields,NumChunks):    IDs = []    Pos_x = []    Pos_y = []    Pos_z = []    start_time = time.time()    for i in range(NumChunks):        print(i)        data_chunk = loadSubset(path,snapNum,partType,fields,chunkNum = i,totNumChunks=NumChunks)        distance = ((data_chunk['Coordinates'][:,0] - central_pos[0])**2 +                    (data_chunk['Coordinates'][:,1] - central_pos[1])**2 +                    (data_chunk['Coordinates'][:,2] - central_pos[2])**2)**0.5        mask = np.where(distance <= radius)[0]        IDs.extend(list(data_chunk['ParticleIDs'][mask]))        Pos_x.extend(list(data_chunk['Coordinates'][mask,0]))        Pos_y.extend(list(data_chunk['Coordinates'][mask,1]))        Pos_z.extend(list(data_chunk['Coordinates'][mask,2]))        print('Parts found',len(data_chunk['ParticleIDs'][mask]))        data_df = {'ParticleIDs' : IDs,               'x' : Pos_x,               'y' : Pos_y,               'z' : Pos_z}    data_df = pd.DataFrame(data = data_df)    end_time = time.time()    abs_time = int(end_time-start_time)    print('{0}\n{1}\n{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)))    return data_df        def grid_division(pos,n_cells,Bsize):    start_time = time.time()    SubBox_size = Bsize/n_cells    try:        i_cell = (pos[:,0]/SubBox_size)        i_cell = i_cell.astype(int)        changex = np.where(i_cell == 10)[0]        i_cell[changex] = 9        j_cell = (pos[:,1]/SubBox_size)        j_cell = j_cell.astype(int)        changey = np.where(j_cell == 10)[0]        j_cell[changey] = 9        k_cell = (pos[:,2]/SubBox_size)        k_cell = k_cell.astype(int)        changez = np.where(k_cell == 10)[0]        k_cell[changez] = 9    except TypeError:        i_cell = (pos[0]/SubBox_size)        i_cell = i_cell.astype(int)        if  i_cell == 10:            i_cell = 9                j_cell = (pos[1]/SubBox_size)        j_cell = j_cell.astype(int)        if j_cell == 10:            j_cell = 9        k_cell = (pos[2]/SubBox_size)        k_cell = k_cell.astype(int)        if k_cell == 10:            k_cell = 9                end_time = time.time()    abs_time = int(end_time-start_time)    print('{0}\n{1}\n{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)))    return i_cell*100 + j_cell*10 + k_celldef selected_boxes(CM,r,bsize):    xmin = ((CM[0] - r)/bsize)    xmax = ((CM[0] + r)/bsize)    ymin = ((CM[1] - r)/bsize)    ymax = ((CM[1] + r)/bsize)    zmin = ((CM[2] - r)/bsize)    zmax = ((CM[2] + r)/bsize)    if xmin < 0:        ad = int(0 - xmin)        xmin = 9 - ad    if ymin < 0:        ad = int(0 - ymin)        ymin = 9 - ad    if zmin < 0:        ad = int(0 - zmin)        zmin = 9 - ad            if xmax > 10:        ad = int(xmax - 10)        xmax = 0 + ad    if ymax > 10:        ad = int(ymax - 10)        ymax = 0 + ad    if zmax > 10:        ad = int(zmax - 10)        zmax = 0 + ad    xmin = int(xmin)    ymin = int(ymin)    zmin = int(zmin)    xmax = int(xmax)    ymax = int(ymax)    zmax = int(zmax)    list_boxes = []    for i in [xmin-1,xmin,xmax,xmax+1]:        for j in [ymin-1,ymin,ymax,ymax+1]:            for k in [zmin-1,zmin,zmax,zmax+1]:                list_boxes.append(i*100 + j*10 +k)            return list_boxes#%%def angle(vector1,vector2):    num = ((((vector1)*(vector2)).sum())**2)**0.5    den = ((((vector1)**2).sum())**0.5)*((((vector2)**2).sum())**0.5)    cos = (num/den)    ang = np.arccos(cos)*360/(2*np.pi)    return angdef cosine(vector1,vector2):    num = ((((vector1)*(vector2)).sum())**2)**0.5    den = ((((vector1)**2).sum())**0.5)*((((vector2)**2).sum())**0.5)    cos = (num/den)    return cosdef latlon_to_sph( lat, lon):    tita = np.pi/2 - lat    fi = lon + np.pi    return tita, fi    def temperature(parts_array):    gamma_minus=2./3.    temp_max= 10000    mask_parts = np.isin(snap.read_block('id','gas'),parts_array)    ids_rand = snap.read_block('id','gas')[mask_parts].values    Hfrac = snap.read_block('metals','gas')['H'][mask_parts].values    mg = (snap.read_block('mass','gas')[mask_parts].values)*unitsmassconv    mg = [mg[i][0] for i in range(len(mg))]    xh = np.divide(Hfrac,mg)/(10**(10))    yHelium = (1 - xh)/(4*xh)    ne = snap.read_block('ne','gas')[mask_parts].values    ne = [ne[i][0] for i in range(len(ne))]    u = snap.read_block('u','gas')[mask_parts].values    u = [u[i][0] for i in range(len(u))]    mu = ((1 + 4.* yHelium)/ (1.+ yHelium + ne)).tolist()    T = [u[i]*mu[i]*gamma_minus*1.6726/ 1.3806*10**(-8)*10**10 for i in range(len(u))]    return [ids_rand,T]###=================================================================================================## From cartesian to spherical coordinatesdef cart_to_sph(aa,bb,cc):    xi = aa    yi = bb    zi = cc    r  = np.sqrt ( xi**2 + yi**2 + zi**2 )    if zi>0:        tita1= np.arctan( np.sqrt(xi**2 + yi**2)/zi )    elif zi==0:        tita1 = np.pi/2.    elif zi<0:        tita1 = np.pi + np.arctan(  np.sqrt(xi**2 + yi**2)/zi )        if ( xi>0. and yi>=0.):        fi1 = np.arctan(yi/xi)    elif (xi>0. and yi<0. ):        fi1 = 2*np.pi + np.arctan(yi/xi)    elif ( xi==0):        fi1 = np.pi/2.*np.sign(yi)    elif  ( xi<0.):        fi1 = np.pi + np.arctan(yi/xi)    return tita1, fi1def latitude(x,y,z):    tita = cart_to_sph(x,y,z)[0]    phi = cart_to_sph(x,y,z)[1]    lat = ((np.pi/2) - tita)#*(180/np.pi)    return latdef longitude(x,y,z):    tita = cart_to_sph(x,y,z)[0]    phi = cart_to_sph(x,y,z)[1]    long = (phi - np.pi)#*(180/np.pi)    return long#calcula la matriz de rotacion para poner un vector [xx,yy,zz] en el eje OZdef calc_mat_rot( xx, yy,zz):     #cart to esfericas    th, ph=  cart_to_sph( xx,yy,zz) ### Primero transforma las coordenadas cartesianas a esféricas    #escribo matrices por filas    ux = [0,0,0]    uy = [0,0,0]    uz = [0,0,0]    ux[0]  =  1. + (np.cos(th) - 1.)* np.cos(ph)**2    ux[1]  =  (np.cos(th)-1.)*np.sin(ph)*np.cos(ph)    ux[2]  =  -np.sin(th)*np.cos(ph)    uy[0]  =  (np.cos(th)-1.)*np.sin(ph)*np.cos(ph)    uy[1]  =  1. + (np.cos(th)-1.)*np.sin(ph)**2    uy[2]  =  -np.sin(th)*np.sin(ph)    uz[0]  =  np.sin(th)*np.cos(ph)    uz[1]  =  np.sin(th)*np.sin(ph)    uz[2]  =  np.cos(th)    # el determinante es 1.   numpy.linalg.det(M) = 1    # cada u_i es una fila de la matriz   ux , uy,  uz    matrix =  [ ux, uy, uz ]    return matrix### Rotación de tal forma que orienta un vector vec1 en la dirección vec2def rotation_matrix_from_vectors(vec1, vec2):    """ Find the rotation matrix that aligns vec1 to vec2    :param vec1: A 3d "source" vector    :param vec2: A 3d "destination" vector    :return mat: A transform matrix (3x3) which when applied to vec1, aligns it with vec2.    """    a, b = (vec1 / np.linalg.norm(vec1)).reshape(3), (vec2 / np.linalg.norm(vec2)).reshape(3)    v = np.cross(a, b)    c = np.dot(a, b)    s = np.linalg.norm(v)    kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])    rotation_matrix = np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2))    return rotation_matrixdef rot_ang_alred_eje_arbi( ux, uy, uz, ang):    # (ux,uy,uz) eje arbitrario definido por vector unitario u. donde modulo =1    # devuelve matriz de rot de un angulo ANG (radianes), sobre el eje u    # matriz por filas:    fx = [0,0,0]    fy = [0,0,0]    fz = [0,0,0]    fx[0]= np.cos( ang) + ux**2 *(1.-np.cos(ang))    fx[1]= ux*uy*(1.-np.cos(ang)) - uz*np.sin(ang)    fx[2]= ux*uz*(1.-np.cos(ang)) + uy*np.sin(ang)    fy[0]= uy*ux*(1.-np.cos(ang)) + uz*np.sin(ang)    fy[1]= np.cos(ang) + uy**2 *(1.-np.cos(ang))    fy[2]= uy*uz*(1.-np.cos(ang)) - ux*np.sin(ang)    fz[0]= uz*ux*(1.-np.cos(ang)) - uy*np.sin(ang)    fz[1]= uz*uy*( 1.-np.cos(ang)) + ux*np.sin(ang)    fz[2]= np.cos(ang) + uz**2 *(1.-np.cos(ang))    matrix = [ fx, fy, fz]    return matrix#%%## Get all DM particles in the first snapshot, where we will start building our Lagrangian Volumes## Do a downsampling to lower the computational costsnap = 0Header_highz = il.groupcat.loadHeader(basePath,snap)h_highz = float(Header['HubbleParam'])unitsconv_highz = 1/(1+float(Header_highz['Redshift']))/h_highzunitsmassconv_highz = 1e10/h_highz## Particle downsampling start_time = time.time()print('Loading snap 0')random.seed(100)dwn_percentage = 200data_snap = []data_snap = il.snapshot.loadSubset(basePath,snap,'dm',['ParticleIDs','Coordinates'])## Once you have saved downsampled_ids, you can simply load it.downsampled_ids = np.random.choice(data_snap['ParticleIDs'],int(len(data_snap['ParticleIDs'])/dwn_percentage),replace = False)with open(savePath+'/parts_simu_downsample'+str(dwn_percentage)+'.txt','wb') as f:    np.save(f,downsampled_ids)f.close()mask_ids = np.isin(data_snap['ParticleIDs'],downsampled_ids)data_used = {}data_used['count'] = len(downsampled_ids)data_used['ParticleIDs'] = data_snap['ParticleIDs'][mask_ids]data_used['Coordinates'] = data_snap['Coordinates'][mask_ids]end_time = time.time()abs_time = int(end_time-start_time)print('Downsampling done','{0}\n{1}\n{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)))#%%## Compute the CoM at zhigh of all DM particles that forma each halo --> Construction center of LVsprint('Finding construction center of the LV')parts_halo = il.snapshot.loadSubhalo(basePath,99,central,'dm',['ParticleIDs']) ## Halo parts. @ z = 0############################################mask_parts = np.isin(data_snap['ParticleIDs'],parts_halo) ## find halo parts. @ zhighparts_halo = []parts_halo_DF = {'x' : data_snap['Coordinates'][mask_parts,0],                 'y' : data_snap['Coordinates'][mask_parts,1],                 'z' : data_snap['Coordinates'][mask_parts,2]}############################################if (max(parts_halo_DF['x']) - min(parts_halo_DF['x'])) > 30000:    mask_change_pos = np.where(parts_halo_DF['x'] > 30000)[0]    parts_halo_DF['x'][mask_change_pos] = parts_halo_DF['x'][mask_change_pos] - 35000    print('Pos. in x changed')if (max(parts_halo_DF['y']) - min(parts_halo_DF['y'])) > 30000:    mask_change_pos = np.where(parts_halo_DF['y'] > 30000)[0]    parts_halo_DF['y'][mask_change_pos] = parts_halo_DF['y'][mask_change_pos] - 35000    print('Pos. in y changed')if (max(parts_halo_DF['z']) - min(parts_halo_DF['z'])) > 30000:    mask_change_pos = np.where(parts_halo_DF['z'] > 30000)[0]    parts_halo_DF['z'][mask_change_pos] = parts_halo_DF['z'][mask_change_pos] - 35000    print('Pos. in z changed')## CM de las partículas que forman el halo a z = 0, pero a alto zx_CM = (np.sum(parts_halo_DF['x']*mass_dm)/(np.sum(mask_parts)*mass_dm))y_CM = (np.sum(parts_halo_DF['y']*mass_dm)/(np.sum(mask_parts)*mass_dm))z_CM = (np.sum(parts_halo_DF['z']*mass_dm)/(np.sum(mask_parts)*mass_dm))#%%## Lagrangian Volume particles in the very first snapshot, up to 20·rvir## If we are gonna obtain the particle IDs of several halos, you need to make copies of the downsampled## snapshot, so you do not modify the original when correcting positions --> data_mockdata_mock = copy.deepcopy(data_used) print('Building the LV. Particles to be tracked across time')############################################start_time = time.time()mask_group = np.isin(GroupsData['GroupFirstSub'],central)Rhalo = GroupsData['Group_R_Crit200'][mask_group] ## Halo radius, in ckpc/hR_LV = 20*Rhalo ## Radio del LV, en comóviles ckpc/h.############################################xCM_central = float(x_CM)yCM_central = float(y_CM)zCM_central = float(z_CM)## Boundary conditionsx_inf = float(xCM_central - R_LV)y_inf = float(yCM_central - R_LV)z_inf = float(zCM_central - R_LV)x_sup = float(xCM_central + R_LV)y_sup = float(yCM_central + R_LV)z_sup = float(zCM_central + R_LV)lims_inf = [x_inf,y_inf,z_inf]lims_sup = [x_sup,y_sup,z_sup]a_inf = []a_sup = []for i in range(len(lims_inf)):    if lims_inf[i] < 0:        a_inf.append(i)for i in range(len(lims_sup)):    if lims_sup[i] > 35000:        a_sup.append(i)## Halos que no se salen de la caja.if ((len(a_sup) == 0) & (len(a_inf) == 0)):    print('No problem')else:    ## 1- Se sale por el límite inferior:    if ((len(a_inf) > 0) & (len(a_sup) == 0)):        print(central,'Problems in the lower limits',a_inf)        if len(a_inf) == 1:            mask_change = np.where(data_mock['Coordinates'][:,a_inf[0]] >= 35000 - np.abs(lims_inf[a_inf[0]]))[0]            data_mock['Coordinates'][mask_change,a_inf[0]] = data_mock['Coordinates'][mask_change,a_inf[0]] - 35000                else:            mask_change_1 = np.where((data_mock['Coordinates'][:,a_inf[0]] >= 35000 - np.abs(lims_inf[a_inf[0]])))[0]            mask_change_2 = np.where((data_mock['Coordinates'][:,a_inf[1]] >= 35000 - np.abs(lims_inf[a_inf[1]])))[0]                        data_mock['Coordinates'][mask_change_1,a_inf[0]] = data_mock['Coordinates'][mask_change_1,a_inf[0]] - 35000            data_mock['Coordinates'][mask_change_2,a_inf[1]] = data_mock['Coordinates'][mask_change_2,a_inf[1]] - 35000    ## 2- Se sale por límites inferior y superior    elif ((len(a_inf) > 0) & (len(a_sup) > 0)):        print(central,'Problems in both upper and lower limits')        mask_change_inf = np.where((data_mock['Coordinates'][:,a_inf[0]] >= 35000 - np.abs(lims_inf[a_inf[0]])))[0]        mask_change_sup = np.where((data_mock['Coordinates'][:,a_sup[0]] <= np.abs(lims_sup[a_sup[0]]) - 35000))[0]                data_mock['Coordinates'][mask_change_inf,a_inf[0]] = data_mock['Coordinates'][mask_change_inf,a_inf[0]] - 35000        data_mock['Coordinates'][mask_change_sup,a_sup[0]] = data_mock['Coordinates'][mask_change_sup,a_sup[0]] + 35000    ## 3- Se sale por límite superior:    else: #(len(a_sup) > 0) & (len(a_inf) == 0):        print(central,'Problems in upper limit',a_sup)        mask_change = np.where((data_mock['Coordinates'][:,a_sup[0]] <= np.abs(lims_sup[a_sup[0]]) - 35000))[0]        data_mock['Coordinates'][mask_change,a_sup[0]] = data_mock['Coordinates'][mask_change,a_sup[0]] + 35000## Buscamos las partículas que se hayan dentro de los límites del LVxparts_snap = data_mock['Coordinates'][:,0] - xCM_centralyparts_snap = data_mock['Coordinates'][:,1] - yCM_centralzparts_snap = data_mock['Coordinates'][:,2] - zCM_centraldparts_snap = np.sqrt(xparts_snap**2 + yparts_snap**2 + zparts_snap**2)mask_parts_LV = np.where(dparts_snap <= R_LV)[0]#############################################################    LV_halo_IDs = (data_mock['ParticleIDs'][mask_parts_LV])#    with open(savePath+'/LVs/LV_halo'+str(central)+'.txt','wb') as f:#        np.save(f,LV_halo_IDs)#    f.close()############################################################LV_halo_IDs = {'ID' : data_used['ParticleIDs'][mask_parts_LV],               'x'  : data_used['Coordinates'][mask_parts_LV,0],               'y'  : data_used['Coordinates'][mask_parts_LV,1],               'z'  : data_used['Coordinates'][mask_parts_LV,2],               'dist' : dparts_snap[mask_parts_LV]}    LV_halo_IDs = pd.DataFrame(data = LV_halo_IDs)print('LV particles:',len(LV_halo_IDs['ID']))LV_halo_IDs.to_csv(savePath+'/LVs/LV_halo'+str(central)+'_parts_info_dwnsample'+str(dwn_percentage)+'.txt', mode = 'w',sep = '\t',index = False)############################################################del data_mockend_time = time.time()abs_time = int(end_time-start_time)print('{0}\n{1}\n{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)))gc.collect()   #%%## Analysis of the LV properties for a given galaxy across timetimesteps = list(np.arange(4,100,5)) ## Timesteps to be analyzed. Modifytimesteps.insert(0,0)K = 15 ## Size of the LV, up to K=20 (see previous step)print('Analysis of the LV properties across time')dwnsampling = 200xCM = []yCM = []zCM = []a = []b = []c = []w1 = []w2 = []w3 = []ev1_1 = []ev2_1 = []ev3_1 = []ev1_2 = []ev2_2 = []ev3_2 = []ev1_3 = []ev2_3 = []ev3_3 = []for snapshot in timesteps:        output_f = open(savePath+'/ToI_analysis/out_snap_'+str(snapshot)+'.dat','w')        print('\n Snapshot',snapshot,file = output_f)    start_time = time.time()        data_snap = []    data_snap = il.snapshot.loadSubset(basePath,snapshot,'dm',['ParticleIDs','Coordinates'])    data_used = {}    downsampled_ids = np.load(savePath+'/parts_simu_downsample200.txt')    mask_ids = np.isin(data_snap['ParticleIDs'],downsampled_ids)    data_used['count'] = len(downsampled_ids)    data_used['ParticleIDs'] = data_snap['ParticleIDs'][mask_ids]    data_used['Coordinates'] = data_snap['Coordinates'][mask_ids]    end_time = time.time()    abs_time = int(end_time-start_time)    print('Snapshot loaded and downsampled','{0},{1},{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)),file = output_f)    Header = il.groupcat.loadHeader(basePath,snapshot)    h = float(Header['HubbleParam'])    unitsconv = 1/(1+float(Header['Redshift']))/h    unitsmassconv = 1e10/h            ## You can create a loop so it computes the LV info at this specific snapshot for an array of centrals    start_time2 = time.time()    ## Cojo las partículas del LV de cada central    print('Halo',central, file = output_f)    print('Halo',central)    data_mock = copy.deepcopy(data_used) ## Hacemos una copia del snapshot, para no modificar el original        ## Impose the analysed LV radius, up to K=20    mask_group = np.isin(GroupsData['GroupFirstSub'],central)        LV_df = pd.read_csv(savePath+'/LVs/LV_halo'+str(central)+'_parts_info_dwnsample'+str(dwnsampling)+'.txt',sep = '\t')    Rhalo = float(GroupsData['Group_R_Crit200'][mask_group]) ## Radio del halo a z = 0, en comóviles ckpc/h    R_LV = K*Rhalo ## Radio del LV, en comóviles ckpc/h.    mask_parts_LV = np.where(LV_df['dist'] <= R_LV)[0]        mask_pos = np.isin(data_mock['ParticleIDs'],LV_df['ID'][mask_parts_LV]) ## Las busco#        n_parts = np.sum(mask_pos)    n_parts = len(LV_df['ID'][mask_parts_LV])    print('Number of particles '+str(n_parts), file = output_f)    mass_arr = [mass_dm]*n_parts        parts_halo_DF = {'ID' : data_mock['ParticleIDs'][mask_pos],                     'x' : data_mock['Coordinates'][mask_pos,0],                     'y' : data_mock['Coordinates'][mask_pos,1],                     'z' : data_mock['Coordinates'][mask_pos,2]}        parts_halo_DF = pd.DataFrame(data = parts_halo_DF)        parts_halo_DF.to_csv(savePath+'/parts_LVs_timesteps/parts_dwnsampling'+str(dwnsampling)+'/parts_halo'+str(central)+'/parts_halo'+str(central)+'_tstep'+str(snapshot)+'_'+str(dwnsampling)+'.txt',mode = 'w',sep = '\t',index = False)        ## Initial CoM of the Lagrangian Volume, without the boundary conditions    xCM_LV = np.sum(parts_halo_DF['x']*mass_dm)/(n_parts*mass_dm)     yCM_LV = np.sum(parts_halo_DF['y']*mass_dm)/(n_parts*mass_dm)    zCM_LV = np.sum(parts_halo_DF['z']*mass_dm)/(n_parts*mass_dm)        ############################################    if (((max(parts_halo_DF['x']) - min(parts_halo_DF['x'])) > 25000) or        ((max(parts_halo_DF['y']) - min(parts_halo_DF['y'])) > 25000) or        ((max(parts_halo_DF['z']) - min(parts_halo_DF['z'])) > 25000)):                ## Cambios en x ##        if (max(parts_halo_DF['x']) - min(parts_halo_DF['x'])) > 25000:            if xCM_LV < 35000/2:                mask_change_pos = np.where(parts_halo_DF['x'] >= 25000)[0]                parts_halo_DF['x'][mask_change_pos] = parts_halo_DF['x'][mask_change_pos] - 35000            else:                mask_change_pos = np.where(parts_halo_DF['x'] <= 10000)[0]                parts_halo_DF['x'][mask_change_pos] = parts_halo_DF['x'][mask_change_pos] + 35000            print('Pos. in x changed')        else:            print('No problem with x')                    ## Cambios en y ##        if (max(parts_halo_DF['y']) - min(parts_halo_DF['y'])) > 25000:            if yCM_LV < 35000/2:                mask_change_pos = np.where(parts_halo_DF['y'] >= 25000)[0]                parts_halo_DF['y'][mask_change_pos] = parts_halo_DF['y'][mask_change_pos] - 35000            else:                mask_change_pos = np.where(parts_halo_DF['y'] <= 10000)[0]                parts_halo_DF['y'][mask_change_pos] = parts_halo_DF['y'][mask_change_pos] + 35000            print('Pos. in y changed')        else:            print('No problem with y')        ## Cambios en z ##        if (max(parts_halo_DF['z']) - min(parts_halo_DF['z'])) > 25000:            if zCM_LV < 35000/2:                mask_change_pos = np.where(parts_halo_DF['z'] >= 25000)[0]                parts_halo_DF['z'][mask_change_pos] = parts_halo_DF['z'][mask_change_pos] - 35000            else:                mask_change_pos = np.where(parts_halo_DF['z'] <= 10000)[0]                parts_halo_DF['z'][mask_change_pos] = parts_halo_DF['z'][mask_change_pos] + 35000            print('Pos. in z changed')        else:            print('No problem with z')    else:        print('No positions changed!')    ## CoM of the LV recalculated    xCM_LV = np.sum(parts_halo_DF['x']*mass_dm)/(n_parts*mass_dm)     yCM_LV = np.sum(parts_halo_DF['y']*mass_dm)/(n_parts*mass_dm)    zCM_LV = np.sum(parts_halo_DF['z']*mass_dm)/(n_parts*mass_dm)        x_LV = (parts_halo_DF['x'] - xCM_LV)*unitsconv    y_LV = (parts_halo_DF['y'] - yCM_LV)*unitsconv    z_LV = (parts_halo_DF['z'] - zCM_LV)*unitsconv        ## Reduced Tensor of Inertia    r2 = (x_LV)**2+(y_LV)**2+(z_LV)**2    I_00 = mass_arr*((y_LV)**2+(z_LV)**2)/r2/(n_parts*mass_dm)    I_11 = mass_arr*((x_LV)**2+(z_LV)**2)/r2/(n_parts*mass_dm)    I_22 = mass_arr*((x_LV)**2+(y_LV)**2)/r2/(n_parts*mass_dm)    I_01 = mass_arr*(-x_LV*y_LV)/r2/(n_parts*mass_dm)    I_02 = mass_arr*(-x_LV*z_LV)/r2/(n_parts*mass_dm)    I_12 = mass_arr*(-y_LV*z_LV)/r2/(n_parts*mass_dm)    I_10 = I_01    I_20 = I_02    I_21 = I_12    Iij_LV = [[np.sum(I_00),np.sum(I_01),np.sum(I_02)],              [np.sum(I_10),np.sum(I_11),np.sum(I_12)],              [np.sum(I_20),np.sum(I_21),np.sum(I_22)]]    Iij_LV = Iij_LV #/(n_parts*mass_dm) ## Hago la matriz de inercia adimensional, dividiendo entre la masa total    eva, eve = np.linalg.eigh(Iij_LV)#        print('Autovalores',eva)    xCM.append(xCM_LV)            yCM.append(yCM_LV)    zCM.append(zCM_LV)        w1.append(eva[0]) # Autovalor menor    w2.append(eva[1]) # Autovalor intermedio    w3.append(eva[2]) # Autovalor mayor    ai = np.sqrt((eva[2]+eva[1]-eva[0])/(eva[0]+eva[1]+eva[2]))    bi = np.sqrt((eva[2]-eva[1]+eva[0])/(eva[0]+eva[1]+eva[2]))    ci = np.sqrt((-eva[2]+eva[1]+eva[0])/(eva[0]+eva[1]+eva[2]))    a.append(ai)    b.append(bi)    c.append(ci)        v1 = eve[0].tolist()    v2 = eve[1].tolist()    v3 = eve[2].tolist()    ev1_1.append(v1[0])    ev2_1.append(v1[1])    ev3_1.append(v1[2])    ev1_2.append(v2[0])    ev2_2.append(v2[1])    ev3_2.append(v2[2])    ev1_3.append(v3[0])    ev2_3.append(v3[1])    ev3_3.append(v3[2])        print('Lenght of the principal axis',[ai,bi,ci])    del data_mock    gc.collect()        end_time2 = time.time()    abs_time2 = int(end_time2-start_time2)    print('LV computed in snapshot',snapshot,'Time:','{0},{1},{2}'.format((abs_time2 // 3600),(abs_time2 % 3600 // 60),(abs_time2 % 60)),file = output_f)del data_snapgc.collect()LV_info_DF = {'snapshot' : timesteps,              'xCM' : xCM,              'yCM' : yCM,              'zCM' : zCM,              'lamb1' : w1,              'lamb2' : w2,              'lamb3' : w3,              'a'     : a,              'b'     : b,              'c'     : c,              'ev1(1)': ev1_1,              'ev1(2)': ev1_2,              'ev1(3)': ev1_3,              'ev2(1)': ev2_1,              'ev2(2)': ev2_2,              'ev2(3)': ev2_3,              'ev3(1)': ev3_1,    #### LA NORMAL AL PLANO ES e3!!!!!!! #######              'ev3(2)': ev3_2,    #### LA NORMAL AL PLANO ES e3!!!!!!! #######              'ev3(3)': ev3_3}    #### LA NORMAL AL PLANO ES e3!!!!!!! #######LV_info_DF = pd.DataFrame(data = LV_info_DF)LV_info_DF.to_csv(savePath+'/LV_info_snap/ToI_analysis/LVs_analysis_halo'+str(central)+'txt',sep = '\t', mode = 'w',index = False)end_time = time.time()abs_time = int(end_time-start_time)print('Total time','{0},{1},{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)),file = output_f)output_f.close()
+import illustris_python as il
+# otras cosas utiles que hay que conviene cargar
+#import yt
+import pandas as pd
+import numpy as np
+from astropy.cosmology import z_at_value
+import astropy.units as u
+from astropy.cosmology import Planck15 as cosmo
+
+import glob
+import pickle
+from collections import defaultdict
+from collections import Counter
+#from natsort import natsorted
+import sys
+import glob
+import copy
+import time
+import os
+import fnmatch
+from scipy.spatial.kdtree import cKDTree
+import gc
+
+import random
+import h5py
+import argparse
+
+random.seed(100)
+
+#%%
+parser = argparse.ArgumentParser(
+    description="Local Volume particle selection for a given halo"
+)
+
+# --- Required arguments ---
+parser.add_argument(
+    "--basePath",
+    type=str,
+    required=True,
+    help="Path to simulation snapshot directory"
+)
+
+parser.add_argument(
+    "--savePath",
+    type=str,
+    required=True,
+    help="Path where output files will be saved"
+)
+
+parser.add_argument(
+    "--halo_id",
+    type=int,
+    required=True,
+    help="Halo ID to analyse"
+)
+
+args = parser.parse_args()
+
+basePath = args.basePath
+savePath = args.savePath
+central = args.halo_id
+os.makedirs(savePath, exist_ok=True)
+
+Header = il.groupcat.loadHeader(basePath,99)
+h = float(Header['HubbleParam'])
+unitsconv = 1/(1+float(Header['Redshift']))/h
+unitsmassconv = 1e10/h
+mass_dm = 3.1*10**5/h
+
+# We need the virial radius and other parameters of our central galaxies
+GroupsData = il.groupcat.loadHalos(basePath,99,['GroupFirstSub','GroupNsubs','Group_R_Crit200','Group_M_Crit200'])
+
+#%%
+
+def read_snapshot(directory,snap):
+    ID = 'dm'
+    try:
+        MainPath = directory+'/snapdir_'+str(snap).zfill(3)+'/snap_'+str(snap).zfill(3)+'_all.hdf5'
+        datos = pd.read_hdf(MainPath)
+    except FileNotFoundError:
+        data_snap = il.snapshot.loadSubset(directory,snap,'dm',['ParticleIDs','Coordinates'])
+        datos = {'ParticleIDs' : data_snap['ParticleIDs'],
+                 'x' : data_snap['Coordinates'][:,0],
+                 'y' : data_snap['Coordinates'][:,1],
+                 'z' : data_snap['Coordinates'][:,2]}
+        datos = pd.DataFrame(data = datos)
+        del data_snap
+        gc.collect()
+        
+        datos.to_hdf(directory+'/snapdir_'+str(snap).zfill(3)+'/snap_'+str(snap).zfill(3)+'_all.hdf5',ID,mode = 'w',format = 'fixed')
+    return datos
+
+
+def select_ids_in_radius(pos, center, radius):
+    ids = np.array([])
+    for p in pos:
+        tree = cKDTree(p.values, 35000)
+        ind = tree.query_ball_point(center, radius, n_jobs=-1)
+        ids = np.concatenate([ids, p.index[ind]])
+        del(tree)
+
+    return ids
+
+    
+
+def save_in_hdf5(snapshot,boxes,b,dataset):
+#    print('Subbox #',b)
+    parts = np.where(boxes == b)[0]
+    hf = h5py.File(basePath+'/snapdir_'+str(snapshot).zfill(3)+'_ordered/snap_'+str(snapshot).zfill(3)+'.'+str(b).zfill(3)+'_ordered.hdf5','a')
+    
+    ##
+    hf['ParticleIDs'].resize(hf['ParticleIDs'].shape[0] + parts.shape[0],axis = 0)
+    hf["ParticleIDs"][-parts.shape[0]:] = list(dataset['ParticleIDs'][parts])
+    ##
+    hf['x'].resize(hf['x'].shape[0] + parts.shape[0],axis = 0)
+    hf["x"][-parts.shape[0]:] = list(dataset['Coordinates'][parts,0])
+    ##
+    hf['y'].resize(hf['y'].shape[0] + parts.shape[0],axis = 0)
+    hf["y"][-parts.shape[0]:] = list(dataset['Coordinates'][parts,1])
+    ##
+    hf['z'].resize(hf['z'].shape[0] + parts.shape[0],axis = 0)
+    hf["z"][-parts.shape[0]:] = list(dataset['Coordinates'][parts,2])
+    hf.close()
+    
+    return print('Box',b,'Done!')
+    
+
+def pSplitRange(indrange, numProcs, curProc, inclusive=False):
+    """ Divide work for embarassingly parallel problems. 
+    Accept a 2-tuple of [start,end] indices and return a new range subset.
+    If inclusive==True, then assume the range subset will be used e.g. as input to snapshotSubseet(),
+    which unlike numpy convention is inclusive in the indices."""
+    assert len(indrange) == 2 and indrange[1] > indrange[0]
+
+    if numProcs == 1:
+        if curProc != 0:
+            raise Exception("Only a single processor but requested curProc>0.")
+        return indrange
+
+    # split array into numProcs segments, and return the curProc'th segment
+    splitSize = int(np.floor( (indrange[1]-indrange[0]) / numProcs ))
+    start = indrange[0] + curProc*splitSize
+    end   = indrange[0] + (curProc+1)*splitSize
+
+    # for last split, make sure it takes any leftovers
+    if curProc == numProcs-1:
+        end = indrange[1]
+
+    if inclusive and curProc < numProcs-1:
+        # not for last split/final index, because this should be e.g. NumPart[0]-1 already
+        end -= 1
+
+    return [start,end]
+
+
+def loadSubset(simPath, snap, partType, fields, chunkNum=0, totNumChunks=1):
+    """ Load part of a snapshot. """
+    nTypes = 6
+    ptNum = il.util.partTypeNum(partType)
+
+    with h5py.File(il.snapshot.snapPath(simPath,snap),'r') as f:
+        numPartTot = il.snapshot.getNumPart( dict(f['Header'].attrs.items()) )[ptNum]
+
+    # define index range
+    indRange_fullSnap = [0,numPartTot-1]
+    indRange = pSplitRange(indRange_fullSnap, totNumChunks, chunkNum, inclusive=True)
+
+    # load a contiguous chunk by making a subset specification in analogy to the group ordered loads
+    subset = { 'offsetType'  : np.zeros(nTypes, dtype='int64'),
+               'lenType'     : np.zeros(nTypes, dtype='int64') }
+
+    subset['offsetType'][ptNum] = indRange[0]
+    subset['lenType'][ptNum]    = indRange[1]-indRange[0]+1
+
+    # add snap offsets (as required)
+    with h5py.File(il.snapshot.offsetPath(simPath,snap),'r') as f:
+        subset['snapOffsets'] = np.transpose(f['FileOffsets/SnapByType'][()])
+
+    # load from disk
+    r = il.snapshot.loadSubset(simPath, snap, partType, fields, subset=subset)
+
+    return r
+
+
+def select_particles_in_region(path,snapNum,partType,central_pos,radius,fields,NumChunks):
+    IDs = []
+    Pos_x = []
+    Pos_y = []
+    Pos_z = []
+    start_time = time.time()
+    for i in range(NumChunks):
+        print(i)
+        data_chunk = loadSubset(path,snapNum,partType,fields,chunkNum = i,totNumChunks=NumChunks)
+        distance = ((data_chunk['Coordinates'][:,0] - central_pos[0])**2 +
+                    (data_chunk['Coordinates'][:,1] - central_pos[1])**2 +
+                    (data_chunk['Coordinates'][:,2] - central_pos[2])**2)**0.5
+        mask = np.where(distance <= radius)[0]
+        IDs.extend(list(data_chunk['ParticleIDs'][mask]))
+        Pos_x.extend(list(data_chunk['Coordinates'][mask,0]))
+        Pos_y.extend(list(data_chunk['Coordinates'][mask,1]))
+        Pos_z.extend(list(data_chunk['Coordinates'][mask,2]))
+        print('Parts found',len(data_chunk['ParticleIDs'][mask]))
+    
+    data_df = {'ParticleIDs' : IDs,
+               'x' : Pos_x,
+               'y' : Pos_y,
+               'z' : Pos_z}
+    data_df = pd.DataFrame(data = data_df)
+    end_time = time.time()
+    abs_time = int(end_time-start_time)
+    print('{0}\n{1}\n{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)))
+
+    return data_df
+        
+def grid_division(pos,n_cells,Bsize):
+    start_time = time.time()
+
+    SubBox_size = Bsize/n_cells
+    try:
+        i_cell = (pos[:,0]/SubBox_size)
+        i_cell = i_cell.astype(int)
+        changex = np.where(i_cell == 10)[0]
+        i_cell[changex] = 9
+        j_cell = (pos[:,1]/SubBox_size)
+        j_cell = j_cell.astype(int)
+        changey = np.where(j_cell == 10)[0]
+        j_cell[changey] = 9
+        k_cell = (pos[:,2]/SubBox_size)
+        k_cell = k_cell.astype(int)
+        changez = np.where(k_cell == 10)[0]
+        k_cell[changez] = 9
+
+    except TypeError:
+        i_cell = (pos[0]/SubBox_size)
+        i_cell = i_cell.astype(int)
+        if  i_cell == 10:
+            i_cell = 9
+        
+        j_cell = (pos[1]/SubBox_size)
+        j_cell = j_cell.astype(int)
+        if j_cell == 10:
+            j_cell = 9
+        k_cell = (pos[2]/SubBox_size)
+        k_cell = k_cell.astype(int)
+        if k_cell == 10:
+            k_cell = 9        
+    
+    end_time = time.time()
+    abs_time = int(end_time-start_time)
+    print('{0}\n{1}\n{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)))
+
+    return i_cell*100 + j_cell*10 + k_cell
+def selected_boxes(CM,r,bsize):
+    xmin = ((CM[0] - r)/bsize)
+    xmax = ((CM[0] + r)/bsize)
+    ymin = ((CM[1] - r)/bsize)
+    ymax = ((CM[1] + r)/bsize)
+    zmin = ((CM[2] - r)/bsize)
+    zmax = ((CM[2] + r)/bsize)
+    if xmin < 0:
+        ad = int(0 - xmin)
+        xmin = 9 - ad
+    if ymin < 0:
+        ad = int(0 - ymin)
+        ymin = 9 - ad
+    if zmin < 0:
+        ad = int(0 - zmin)
+        zmin = 9 - ad
+        
+    if xmax > 10:
+        ad = int(xmax - 10)
+        xmax = 0 + ad
+    if ymax > 10:
+        ad = int(ymax - 10)
+        ymax = 0 + ad
+    if zmax > 10:
+        ad = int(zmax - 10)
+        zmax = 0 + ad
+    xmin = int(xmin)
+    ymin = int(ymin)
+    zmin = int(zmin)
+    xmax = int(xmax)
+    ymax = int(ymax)
+    zmax = int(zmax)
+    list_boxes = []
+    for i in [xmin-1,xmin,xmax,xmax+1]:
+        for j in [ymin-1,ymin,ymax,ymax+1]:
+            for k in [zmin-1,zmin,zmax,zmax+1]:
+                list_boxes.append(i*100 + j*10 +k)        
+    return list_boxes
+
+#%%
+
+def angle(vector1,vector2):
+    num = ((((vector1)*(vector2)).sum())**2)**0.5
+    den = ((((vector1)**2).sum())**0.5)*((((vector2)**2).sum())**0.5)
+    cos = (num/den)
+    ang = np.arccos(cos)*360/(2*np.pi)
+    return ang
+
+def cosine(vector1,vector2):
+    num = ((((vector1)*(vector2)).sum())**2)**0.5
+    den = ((((vector1)**2).sum())**0.5)*((((vector2)**2).sum())**0.5)
+    cos = (num/den)
+    return cos
+
+def latlon_to_sph( lat, lon):
+    tita = np.pi/2 - lat
+    fi = lon + np.pi
+    return tita, fi
+    
+
+def temperature(parts_array):
+    gamma_minus=2./3.
+    temp_max= 10000
+    mask_parts = np.isin(snap.read_block('id','gas'),parts_array)
+    ids_rand = snap.read_block('id','gas')[mask_parts].values
+    Hfrac = snap.read_block('metals','gas')['H'][mask_parts].values
+    mg = (snap.read_block('mass','gas')[mask_parts].values)*unitsmassconv
+    mg = [mg[i][0] for i in range(len(mg))]
+    xh = np.divide(Hfrac,mg)/(10**(10))
+    yHelium = (1 - xh)/(4*xh)
+    ne = snap.read_block('ne','gas')[mask_parts].values
+    ne = [ne[i][0] for i in range(len(ne))]
+    u = snap.read_block('u','gas')[mask_parts].values
+    u = [u[i][0] for i in range(len(u))]
+    mu = ((1 + 4.* yHelium)/ (1.+ yHelium + ne)).tolist()
+    T = [u[i]*mu[i]*gamma_minus*1.6726/ 1.3806*10**(-8)*10**10 for i in range(len(u))]
+    return [ids_rand,T]
+
+
+
+###=================================================================================================
+
+## From cartesian to spherical coordinates
+
+def cart_to_sph(aa,bb,cc):
+    xi = aa
+    yi = bb
+    zi = cc
+    r  = np.sqrt ( xi**2 + yi**2 + zi**2 )
+    if zi>0:
+        tita1= np.arctan( np.sqrt(xi**2 + yi**2)/zi )
+    elif zi==0:
+        tita1 = np.pi/2.
+    elif zi<0:
+        tita1 = np.pi + np.arctan(  np.sqrt(xi**2 + yi**2)/zi )
+    
+    if ( xi>0. and yi>=0.):
+        fi1 = np.arctan(yi/xi)
+    elif (xi>0. and yi<0. ):
+        fi1 = 2*np.pi + np.arctan(yi/xi)
+    elif ( xi==0):
+        fi1 = np.pi/2.*np.sign(yi)
+    elif  ( xi<0.):
+        fi1 = np.pi + np.arctan(yi/xi)
+    return tita1, fi1
+
+def latitude(x,y,z):
+    tita = cart_to_sph(x,y,z)[0]
+    phi = cart_to_sph(x,y,z)[1]
+    lat = ((np.pi/2) - tita)#*(180/np.pi)
+    return lat
+
+def longitude(x,y,z):
+    tita = cart_to_sph(x,y,z)[0]
+    phi = cart_to_sph(x,y,z)[1]
+    long = (phi - np.pi)#*(180/np.pi)
+    return long
+
+
+#calcula la matriz de rotacion para poner un vector [xx,yy,zz] en el eje OZ
+def calc_mat_rot( xx, yy,zz): 
+    #cart to esfericas
+    th, ph=  cart_to_sph( xx,yy,zz) ### Primero transforma las coordenadas cartesianas a esféricas
+    #escribo matrices por filas
+    ux = [0,0,0]
+    uy = [0,0,0]
+    uz = [0,0,0]
+    ux[0]  =  1. + (np.cos(th) - 1.)* np.cos(ph)**2
+    ux[1]  =  (np.cos(th)-1.)*np.sin(ph)*np.cos(ph)
+    ux[2]  =  -np.sin(th)*np.cos(ph)
+    uy[0]  =  (np.cos(th)-1.)*np.sin(ph)*np.cos(ph)
+    uy[1]  =  1. + (np.cos(th)-1.)*np.sin(ph)**2
+    uy[2]  =  -np.sin(th)*np.sin(ph)
+    uz[0]  =  np.sin(th)*np.cos(ph)
+    uz[1]  =  np.sin(th)*np.sin(ph)
+    uz[2]  =  np.cos(th)
+    # el determinante es 1.   numpy.linalg.det(M) = 1
+    # cada u_i es una fila de la matriz   ux , uy,  uz
+    matrix =  [ ux, uy, uz ]
+    return matrix
+
+
+
+
+### Rotación de tal forma que orienta un vector vec1 en la dirección vec2
+def rotation_matrix_from_vectors(vec1, vec2):
+    """ Find the rotation matrix that aligns vec1 to vec2
+    :param vec1: A 3d "source" vector
+    :param vec2: A 3d "destination" vector
+    :return mat: A transform matrix (3x3) which when applied to vec1, aligns it with vec2.
+    """
+    a, b = (vec1 / np.linalg.norm(vec1)).reshape(3), (vec2 / np.linalg.norm(vec2)).reshape(3)
+    v = np.cross(a, b)
+    c = np.dot(a, b)
+    s = np.linalg.norm(v)
+    kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    rotation_matrix = np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2))
+    return rotation_matrix
+
+def rot_ang_alred_eje_arbi( ux, uy, uz, ang):
+    # (ux,uy,uz) eje arbitrario definido por vector unitario u. donde modulo =1
+    # devuelve matriz de rot de un angulo ANG (radianes), sobre el eje u
+    # matriz por filas:
+    fx = [0,0,0]
+    fy = [0,0,0]
+    fz = [0,0,0]
+    fx[0]= np.cos( ang) + ux**2 *(1.-np.cos(ang))
+    fx[1]= ux*uy*(1.-np.cos(ang)) - uz*np.sin(ang)
+    fx[2]= ux*uz*(1.-np.cos(ang)) + uy*np.sin(ang)
+    fy[0]= uy*ux*(1.-np.cos(ang)) + uz*np.sin(ang)
+    fy[1]= np.cos(ang) + uy**2 *(1.-np.cos(ang))
+    fy[2]= uy*uz*(1.-np.cos(ang)) - ux*np.sin(ang)
+    fz[0]= uz*ux*(1.-np.cos(ang)) - uy*np.sin(ang)
+    fz[1]= uz*uy*( 1.-np.cos(ang)) + ux*np.sin(ang)
+    fz[2]= np.cos(ang) + uz**2 *(1.-np.cos(ang))
+    matrix = [ fx, fy, fz]
+    return matrix
+
+#%%
+
+## Get all DM particles in the first snapshot, where we will start building our Lagrangian Volumes
+## Do a downsampling to lower the computational cost
+snap = 0
+Header_highz = il.groupcat.loadHeader(basePath,snap)
+h_highz = float(Header['HubbleParam'])
+unitsconv_highz = 1/(1+float(Header_highz['Redshift']))/h_highz
+unitsmassconv_highz = 1e10/h_highz
+
+## Particle downsampling 
+start_time = time.time()
+print('Loading snap 0')
+random.seed(100)
+
+dwn_percentage = 200
+data_snap = []
+data_snap = il.snapshot.loadSubset(basePath,snap,'dm',['ParticleIDs','Coordinates'])
+
+## Once you have saved downsampled_ids, you can simply load it.
+downsampled_ids = np.random.choice(data_snap['ParticleIDs'],int(len(data_snap['ParticleIDs'])/dwn_percentage),replace = False)
+with open(savePath+'/parts_simu_downsample'+str(dwn_percentage)+'.txt','wb') as f:
+    np.save(f,downsampled_ids)
+f.close()
+
+mask_ids = np.isin(data_snap['ParticleIDs'],downsampled_ids)
+data_used = {}
+data_used['count'] = len(downsampled_ids)
+data_used['ParticleIDs'] = data_snap['ParticleIDs'][mask_ids]
+data_used['Coordinates'] = data_snap['Coordinates'][mask_ids]
+
+end_time = time.time()
+abs_time = int(end_time-start_time)
+print('Downsampling done','{0}\n{1}\n{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)))
+
+#%%
+## Compute the CoM at zhigh of all DM particles that forma each halo --> Construction center of LVs
+
+print('Finding construction center of the LV')
+parts_halo = il.snapshot.loadSubhalo(basePath,99,central,'dm',['ParticleIDs']) ## Halo parts. @ z = 0
+
+############################################
+mask_parts = np.isin(data_snap['ParticleIDs'],parts_halo) ## find halo parts. @ zhigh
+parts_halo = []
+
+parts_halo_DF = {'x' : data_snap['Coordinates'][mask_parts,0],
+                 'y' : data_snap['Coordinates'][mask_parts,1],
+                 'z' : data_snap['Coordinates'][mask_parts,2]}
+
+############################################
+if (max(parts_halo_DF['x']) - min(parts_halo_DF['x'])) > 30000:
+    mask_change_pos = np.where(parts_halo_DF['x'] > 30000)[0]
+    parts_halo_DF['x'][mask_change_pos] = parts_halo_DF['x'][mask_change_pos] - 35000
+    print('Pos. in x changed')
+if (max(parts_halo_DF['y']) - min(parts_halo_DF['y'])) > 30000:
+    mask_change_pos = np.where(parts_halo_DF['y'] > 30000)[0]
+    parts_halo_DF['y'][mask_change_pos] = parts_halo_DF['y'][mask_change_pos] - 35000
+    print('Pos. in y changed')
+if (max(parts_halo_DF['z']) - min(parts_halo_DF['z'])) > 30000:
+    mask_change_pos = np.where(parts_halo_DF['z'] > 30000)[0]
+    parts_halo_DF['z'][mask_change_pos] = parts_halo_DF['z'][mask_change_pos] - 35000
+    print('Pos. in z changed')
+
+
+## CM de las partículas que forman el halo a z = 0, pero a alto z
+x_CM = (np.sum(parts_halo_DF['x']*mass_dm)/(np.sum(mask_parts)*mass_dm))
+y_CM = (np.sum(parts_halo_DF['y']*mass_dm)/(np.sum(mask_parts)*mass_dm))
+z_CM = (np.sum(parts_halo_DF['z']*mass_dm)/(np.sum(mask_parts)*mass_dm))
+
+
+#%%
+
+## Lagrangian Volume particles in the very first snapshot, up to 20·rvir
+
+## If we are gonna obtain the particle IDs of several halos, you need to make copies of the downsampled
+## snapshot, so you do not modify the original when correcting positions --> data_mock
+data_mock = copy.deepcopy(data_used) 
+print('Building the LV. Particles to be tracked across time')
+############################################
+start_time = time.time()
+mask_group = np.isin(GroupsData['GroupFirstSub'],central)
+Rhalo = GroupsData['Group_R_Crit200'][mask_group] ## Halo radius, in ckpc/h
+R_LV = 20*Rhalo ## Radio del LV, en comóviles ckpc/h.
+############################################
+xCM_central = float(x_CM)
+yCM_central = float(y_CM)
+zCM_central = float(z_CM)
+
+## Boundary conditions
+x_inf = float(xCM_central - R_LV)
+y_inf = float(yCM_central - R_LV)
+z_inf = float(zCM_central - R_LV)
+x_sup = float(xCM_central + R_LV)
+y_sup = float(yCM_central + R_LV)
+z_sup = float(zCM_central + R_LV)
+lims_inf = [x_inf,y_inf,z_inf]
+lims_sup = [x_sup,y_sup,z_sup]
+
+a_inf = []
+a_sup = []
+for i in range(len(lims_inf)):
+    if lims_inf[i] < 0:
+        a_inf.append(i)
+for i in range(len(lims_sup)):
+    if lims_sup[i] > 35000:
+        a_sup.append(i)
+
+## Halos que no se salen de la caja.
+if ((len(a_sup) == 0) & (len(a_inf) == 0)):
+    print('No problem')
+
+else:
+
+    ## 1- Se sale por el límite inferior:
+    if ((len(a_inf) > 0) & (len(a_sup) == 0)):
+        print(central,'Problems in the lower limits',a_inf)
+
+        if len(a_inf) == 1:
+            mask_change = np.where(data_mock['Coordinates'][:,a_inf[0]] >= 35000 - np.abs(lims_inf[a_inf[0]]))[0]
+            data_mock['Coordinates'][mask_change,a_inf[0]] = data_mock['Coordinates'][mask_change,a_inf[0]] - 35000
+        
+        else:
+            mask_change_1 = np.where((data_mock['Coordinates'][:,a_inf[0]] >= 35000 - np.abs(lims_inf[a_inf[0]])))[0]
+            mask_change_2 = np.where((data_mock['Coordinates'][:,a_inf[1]] >= 35000 - np.abs(lims_inf[a_inf[1]])))[0]
+            
+            data_mock['Coordinates'][mask_change_1,a_inf[0]] = data_mock['Coordinates'][mask_change_1,a_inf[0]] - 35000
+            data_mock['Coordinates'][mask_change_2,a_inf[1]] = data_mock['Coordinates'][mask_change_2,a_inf[1]] - 35000
+
+    ## 2- Se sale por límites inferior y superior
+    elif ((len(a_inf) > 0) & (len(a_sup) > 0)):
+        print(central,'Problems in both upper and lower limits')
+        mask_change_inf = np.where((data_mock['Coordinates'][:,a_inf[0]] >= 35000 - np.abs(lims_inf[a_inf[0]])))[0]
+        mask_change_sup = np.where((data_mock['Coordinates'][:,a_sup[0]] <= np.abs(lims_sup[a_sup[0]]) - 35000))[0]
+        
+        data_mock['Coordinates'][mask_change_inf,a_inf[0]] = data_mock['Coordinates'][mask_change_inf,a_inf[0]] - 35000
+        data_mock['Coordinates'][mask_change_sup,a_sup[0]] = data_mock['Coordinates'][mask_change_sup,a_sup[0]] + 35000
+
+    ## 3- Se sale por límite superior:
+    else: #(len(a_sup) > 0) & (len(a_inf) == 0):
+        print(central,'Problems in upper limit',a_sup)
+        mask_change = np.where((data_mock['Coordinates'][:,a_sup[0]] <= np.abs(lims_sup[a_sup[0]]) - 35000))[0]
+        data_mock['Coordinates'][mask_change,a_sup[0]] = data_mock['Coordinates'][mask_change,a_sup[0]] + 35000
+
+## Buscamos las partículas que se hayan dentro de los límites del LV
+
+xparts_snap = data_mock['Coordinates'][:,0] - xCM_central
+yparts_snap = data_mock['Coordinates'][:,1] - yCM_central
+zparts_snap = data_mock['Coordinates'][:,2] - zCM_central
+dparts_snap = np.sqrt(xparts_snap**2 + yparts_snap**2 + zparts_snap**2)
+
+mask_parts_LV = np.where(dparts_snap <= R_LV)[0]
+
+############################################################
+#    LV_halo_IDs = (data_mock['ParticleIDs'][mask_parts_LV])
+#    with open(savePath+'/LVs/LV_halo'+str(central)+'.txt','wb') as f:
+#        np.save(f,LV_halo_IDs)
+#    f.close()
+############################################################
+LV_halo_IDs = {'ID' : data_used['ParticleIDs'][mask_parts_LV],
+               'x'  : data_used['Coordinates'][mask_parts_LV,0],
+               'y'  : data_used['Coordinates'][mask_parts_LV,1],
+               'z'  : data_used['Coordinates'][mask_parts_LV,2],
+               'dist' : dparts_snap[mask_parts_LV]}    
+LV_halo_IDs = pd.DataFrame(data = LV_halo_IDs)
+print('LV particles:',len(LV_halo_IDs['ID']))
+
+LV_halo_IDs.to_csv(savePath+'/LVs/LV_halo'+str(central)+'_parts_info_dwnsample'+str(dwn_percentage)+'.txt', mode = 'w',sep = '\t',index = False)
+############################################################
+del data_mock
+
+
+end_time = time.time()
+abs_time = int(end_time-start_time)
+print('{0}\n{1}\n{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)))
+gc.collect()   
+
+#%%
+## Analysis of the LV properties for a given galaxy across time
+timesteps = list(np.arange(4,100,5)) ## Timesteps to be analyzed. Modify
+timesteps.insert(0,0)
+K = 15 ## Size of the LV, up to K=20 (see previous step)
+
+print('Analysis of the LV properties across time')
+dwnsampling = 200
+
+xCM = []
+yCM = []
+zCM = []
+a = []
+b = []
+c = []
+w1 = []
+w2 = []
+w3 = []
+ev1_1 = []
+ev2_1 = []
+ev3_1 = []
+ev1_2 = []
+ev2_2 = []
+ev3_2 = []
+ev1_3 = []
+ev2_3 = []
+ev3_3 = []
+for snapshot in timesteps:
+    
+    output_f = open(savePath+'/ToI_analysis/out_snap_'+str(snapshot)+'.dat','w')
+    
+    print('\n Snapshot',snapshot,file = output_f)
+    start_time = time.time()
+    
+    data_snap = []
+    data_snap = il.snapshot.loadSubset(basePath,snapshot,'dm',['ParticleIDs','Coordinates'])
+    data_used = {}
+    downsampled_ids = np.load(savePath+'/parts_simu_downsample200.txt')
+    mask_ids = np.isin(data_snap['ParticleIDs'],downsampled_ids)
+    data_used['count'] = len(downsampled_ids)
+    data_used['ParticleIDs'] = data_snap['ParticleIDs'][mask_ids]
+    data_used['Coordinates'] = data_snap['Coordinates'][mask_ids]
+
+    end_time = time.time()
+    abs_time = int(end_time-start_time)
+    print('Snapshot loaded and downsampled','{0},{1},{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)),file = output_f)
+
+    Header = il.groupcat.loadHeader(basePath,snapshot)
+    h = float(Header['HubbleParam'])
+    unitsconv = 1/(1+float(Header['Redshift']))/h
+    unitsmassconv = 1e10/h
+        
+    ## You can create a loop so it computes the LV info at this specific snapshot for an array of centrals
+    start_time2 = time.time()
+
+    ## Cojo las partículas del LV de cada central
+    print('Halo',central, file = output_f)
+    print('Halo',central)
+    data_mock = copy.deepcopy(data_used) ## Hacemos una copia del snapshot, para no modificar el original
+    
+    ## Impose the analysed LV radius, up to K=20
+    mask_group = np.isin(GroupsData['GroupFirstSub'],central)
+    
+    LV_df = pd.read_csv(savePath+'/LVs/LV_halo'+str(central)+'_parts_info_dwnsample'+str(dwnsampling)+'.txt',sep = '\t')
+    Rhalo = float(GroupsData['Group_R_Crit200'][mask_group]) ## Radio del halo a z = 0, en comóviles ckpc/h
+    R_LV = K*Rhalo ## Radio del LV, en comóviles ckpc/h.
+    mask_parts_LV = np.where(LV_df['dist'] <= R_LV)[0]
+    
+    mask_pos = np.isin(data_mock['ParticleIDs'],LV_df['ID'][mask_parts_LV]) ## Las busco
+#        n_parts = np.sum(mask_pos)
+    n_parts = len(LV_df['ID'][mask_parts_LV])
+    print('Number of particles '+str(n_parts), file = output_f)
+    mass_arr = [mass_dm]*n_parts
+    
+    parts_halo_DF = {'ID' : data_mock['ParticleIDs'][mask_pos],
+                     'x' : data_mock['Coordinates'][mask_pos,0],
+                     'y' : data_mock['Coordinates'][mask_pos,1],
+                     'z' : data_mock['Coordinates'][mask_pos,2]}
+    
+    parts_halo_DF = pd.DataFrame(data = parts_halo_DF)
+    
+    parts_halo_DF.to_csv(savePath+'/parts_LVs_timesteps/parts_dwnsampling'+str(dwnsampling)+'/parts_halo'+str(central)+'/parts_halo'+str(central)+'_tstep'+str(snapshot)+'_'+str(dwnsampling)+'.txt',mode = 'w',sep = '\t',index = False)
+    
+    ## Initial CoM of the Lagrangian Volume, without the boundary conditions
+    xCM_LV = np.sum(parts_halo_DF['x']*mass_dm)/(n_parts*mass_dm) 
+    yCM_LV = np.sum(parts_halo_DF['y']*mass_dm)/(n_parts*mass_dm)
+    zCM_LV = np.sum(parts_halo_DF['z']*mass_dm)/(n_parts*mass_dm)
+    
+    ############################################
+    if (((max(parts_halo_DF['x']) - min(parts_halo_DF['x'])) > 25000) or
+        ((max(parts_halo_DF['y']) - min(parts_halo_DF['y'])) > 25000) or
+        ((max(parts_halo_DF['z']) - min(parts_halo_DF['z'])) > 25000)):
+        
+        ## Cambios en x ##
+        if (max(parts_halo_DF['x']) - min(parts_halo_DF['x'])) > 25000:
+            if xCM_LV < 35000/2:
+                mask_change_pos = np.where(parts_halo_DF['x'] >= 25000)[0]
+                parts_halo_DF['x'][mask_change_pos] = parts_halo_DF['x'][mask_change_pos] - 35000
+            else:
+                mask_change_pos = np.where(parts_halo_DF['x'] <= 10000)[0]
+                parts_halo_DF['x'][mask_change_pos] = parts_halo_DF['x'][mask_change_pos] + 35000
+            print('Pos. in x changed')
+        else:
+            print('No problem with x')
+            
+        ## Cambios en y ##
+        if (max(parts_halo_DF['y']) - min(parts_halo_DF['y'])) > 25000:
+            if yCM_LV < 35000/2:
+                mask_change_pos = np.where(parts_halo_DF['y'] >= 25000)[0]
+                parts_halo_DF['y'][mask_change_pos] = parts_halo_DF['y'][mask_change_pos] - 35000
+            else:
+                mask_change_pos = np.where(parts_halo_DF['y'] <= 10000)[0]
+                parts_halo_DF['y'][mask_change_pos] = parts_halo_DF['y'][mask_change_pos] + 35000
+            print('Pos. in y changed')
+        else:
+            print('No problem with y')
+
+        ## Cambios en z ##
+        if (max(parts_halo_DF['z']) - min(parts_halo_DF['z'])) > 25000:
+            if zCM_LV < 35000/2:
+                mask_change_pos = np.where(parts_halo_DF['z'] >= 25000)[0]
+                parts_halo_DF['z'][mask_change_pos] = parts_halo_DF['z'][mask_change_pos] - 35000
+            else:
+                mask_change_pos = np.where(parts_halo_DF['z'] <= 10000)[0]
+                parts_halo_DF['z'][mask_change_pos] = parts_halo_DF['z'][mask_change_pos] + 35000
+            print('Pos. in z changed')
+        else:
+            print('No problem with z')
+
+    else:
+        print('No positions changed!')
+
+    ## CoM of the LV recalculated
+    xCM_LV = np.sum(parts_halo_DF['x']*mass_dm)/(n_parts*mass_dm) 
+    yCM_LV = np.sum(parts_halo_DF['y']*mass_dm)/(n_parts*mass_dm)
+    zCM_LV = np.sum(parts_halo_DF['z']*mass_dm)/(n_parts*mass_dm)
+    
+    x_LV = (parts_halo_DF['x'] - xCM_LV)*unitsconv
+    y_LV = (parts_halo_DF['y'] - yCM_LV)*unitsconv
+    z_LV = (parts_halo_DF['z'] - zCM_LV)*unitsconv
+    
+    ## Reduced Tensor of Inertia
+    r2 = (x_LV)**2+(y_LV)**2+(z_LV)**2
+    I_00 = mass_arr*((y_LV)**2+(z_LV)**2)/r2/(n_parts*mass_dm)
+    I_11 = mass_arr*((x_LV)**2+(z_LV)**2)/r2/(n_parts*mass_dm)
+    I_22 = mass_arr*((x_LV)**2+(y_LV)**2)/r2/(n_parts*mass_dm)
+    I_01 = mass_arr*(-x_LV*y_LV)/r2/(n_parts*mass_dm)
+    I_02 = mass_arr*(-x_LV*z_LV)/r2/(n_parts*mass_dm)
+    I_12 = mass_arr*(-y_LV*z_LV)/r2/(n_parts*mass_dm)
+    I_10 = I_01
+    I_20 = I_02
+    I_21 = I_12
+    Iij_LV = [[np.sum(I_00),np.sum(I_01),np.sum(I_02)],
+              [np.sum(I_10),np.sum(I_11),np.sum(I_12)],
+              [np.sum(I_20),np.sum(I_21),np.sum(I_22)]]
+    Iij_LV = Iij_LV #/(n_parts*mass_dm) ## Hago la matriz de inercia adimensional, dividiendo entre la masa total
+    eva, eve = np.linalg.eigh(Iij_LV)
+#        print('Autovalores',eva)
+
+    xCM.append(xCM_LV)        
+    yCM.append(yCM_LV)
+    zCM.append(zCM_LV)
+    
+    w1.append(eva[0]) # Autovalor menor
+    w2.append(eva[1]) # Autovalor intermedio
+    w3.append(eva[2]) # Autovalor mayor
+
+    ai = np.sqrt((eva[2]+eva[1]-eva[0])/(eva[0]+eva[1]+eva[2]))
+    bi = np.sqrt((eva[2]-eva[1]+eva[0])/(eva[0]+eva[1]+eva[2]))
+    ci = np.sqrt((-eva[2]+eva[1]+eva[0])/(eva[0]+eva[1]+eva[2]))
+    a.append(ai)
+    b.append(bi)
+    c.append(ci)
+    
+    v1 = eve[0].tolist()
+    v2 = eve[1].tolist()
+    v3 = eve[2].tolist()
+    ev1_1.append(v1[0])
+    ev2_1.append(v1[1])
+    ev3_1.append(v1[2])
+    ev1_2.append(v2[0])
+    ev2_2.append(v2[1])
+    ev3_2.append(v2[2])
+    ev1_3.append(v3[0])
+    ev2_3.append(v3[1])
+    ev3_3.append(v3[2])
+    
+    print('Lenght of the principal axis',[ai,bi,ci])
+    del data_mock
+    gc.collect()
+    
+    end_time2 = time.time()
+    abs_time2 = int(end_time2-start_time2)
+    print('LV computed in snapshot',snapshot,'Time:','{0},{1},{2}'.format((abs_time2 // 3600),(abs_time2 % 3600 // 60),(abs_time2 % 60)),file = output_f)
+
+del data_snap
+gc.collect()
+
+LV_info_DF = {'snapshot' : timesteps,
+              'xCM' : xCM,
+              'yCM' : yCM,
+              'zCM' : zCM,
+              'lamb1' : w1,
+              'lamb2' : w2,
+              'lamb3' : w3,
+              'a'     : a,
+              'b'     : b,
+              'c'     : c,
+              'ev1(1)': ev1_1,
+              'ev1(2)': ev1_2,
+              'ev1(3)': ev1_3,
+              'ev2(1)': ev2_1,
+              'ev2(2)': ev2_2,
+              'ev2(3)': ev2_3,
+              'ev3(1)': ev3_1,    #### LA NORMAL AL PLANO ES e3!!!!!!! #######
+              'ev3(2)': ev3_2,    #### LA NORMAL AL PLANO ES e3!!!!!!! #######
+              'ev3(3)': ev3_3}    #### LA NORMAL AL PLANO ES e3!!!!!!! #######
+LV_info_DF = pd.DataFrame(data = LV_info_DF)
+LV_info_DF.to_csv(savePath+'/LV_info_snap/ToI_analysis/LVs_analysis_halo'+str(central)+'txt',sep = '\t', mode = 'w',index = False)
+
+end_time = time.time()
+abs_time = int(end_time-start_time)
+print('Total time','{0},{1},{2}'.format((abs_time // 3600),(abs_time % 3600 // 60),(abs_time % 60)),file = output_f)
+
+output_f.close()
+
+
