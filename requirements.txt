@@ -1,0 +1,9 @@
+illustris_python
+pandas
+numpy
+matplotlib
+astropy
+scipy
+requests
+joblib
+h5py
