@@ -1,4 +1,4 @@
-## Lagrangian Volume Particle Selection Tool
+# Lagrangian Volume Particle Selection Tool
 
 This repository provides a Python tool for selecting particles belonging to the Lagrangian Volume around a given galaxy in cosmological simulations, and for analysing the morphology of the local Cosmic Web environment surrounding that galaxy.
 
